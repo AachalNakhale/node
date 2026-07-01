@@ -14,6 +14,7 @@
 #include "src/heap/heap-inl.h"
 #include "src/heap/large-page.h"
 #include "src/heap/large-spaces.h"
+#include "src/heap/memory-chunk-layout.h"
 #include "src/heap/normal-page.h"
 #include "src/logging/counters.h"
 #include "src/objects/heap-object.h"
@@ -28,6 +29,8 @@ HeapAllocator::HeapAllocator(LocalHeap* local_heap)
     : local_heap_(local_heap), heap_(local_heap->heap()) {}
 
 void HeapAllocator::Setup() {
+  max_regular_code_object_size_ = MemoryChunkLayout::MaxRegularCodeObjectSize();
+
   for (int i = FIRST_SPACE; i <= LAST_SPACE; ++i) {
     spaces_[i] = heap_->space(i);
   }
@@ -85,7 +88,7 @@ void HeapAllocator::SetReadOnlySpace(ReadOnlySpace* read_only_space) {
 AllocationResult HeapAllocator::AllocateRawLargeInternal(
     int size_in_bytes, AllocationType allocation, AllocationOrigin origin,
     AllocationAlignment alignment, AllocationHint hint) {
-  DCHECK_GT(size_in_bytes, heap_->MaxRegularHeapObjectSize(allocation));
+  DCHECK_GT(size_in_bytes, MaxRegularHeapObjectSize(allocation));
   AllocationResult allocation_result;
   switch (allocation) {
     case AllocationType::kYoung:
@@ -142,20 +145,21 @@ constexpr AllocationSpace AllocationTypeToGCSpace(AllocationType type) {
     case AllocationType::kSharedTrusted:
       UNREACHABLE();
   }
+  UNREACHABLE();
 }
 
 }  // namespace
 
 void HeapAllocator::CollectGarbage(
-    AllocationType allocation, PerformHeapLimitCheck perform_heap_limit_check) {
+    AllocationType allocation, PerformHeapLimitCheck perform_heap_limit_check,
+    GarbageCollectionReason gc_reason) {
   if (IsSharedAllocationType(allocation)) {
     auto* isolate = heap_->isolate();
     if (isolate->shared_space_isolate() == isolate &&
         local_heap_->is_main_thread()) {
       AllocationSpace space_to_gc = AllocationTypeToGCSpace(allocation);
-      heap_->CollectGarbage(space_to_gc,
-                            GarbageCollectionReason::kAllocationFailure,
-                            kNoGCCallbackFlags, perform_heap_limit_check);
+      heap_->CollectGarbage(space_to_gc, gc_reason, kNoGCCallbackFlags,
+                            perform_heap_limit_check);
     } else {
       isolate->shared_space_isolate()
           ->heap()
@@ -165,9 +169,8 @@ void HeapAllocator::CollectGarbage(
   } else if (local_heap_->is_main_thread()) {
     // On the main thread we can directly start the GC.
     AllocationSpace space_to_gc = AllocationTypeToGCSpace(allocation);
-    heap_->CollectGarbage(space_to_gc,
-                          GarbageCollectionReason::kAllocationFailure,
-                          kNoGCCallbackFlags, perform_heap_limit_check);
+    heap_->CollectGarbage(space_to_gc, gc_reason, kNoGCCallbackFlags,
+                          perform_heap_limit_check);
   } else {
     // Request GC from main thread.
     heap_->TriggerAndWaitForGCFromBackgroundThread(local_heap_,
@@ -212,10 +215,12 @@ Tagged<HeapObject> HeapAllocator::AllocateRawSlowPath(
   };
 
   if (retry_mode == AllocationRetryMode::kLightRetry) {
-    RetryCustomAllocateLight(allocate, allocation);
+    RetryCustomAllocateLight(allocate, allocation,
+                             GarbageCollectionReason::kAllocationFailure);
   } else {
     DCHECK_EQ(retry_mode, AllocationRetryMode::kRetryOrFail);
-    RetryCustomAllocateOrFail(allocate, allocation);
+    RetryCustomAllocateOrFail(allocate, allocation,
+                              GarbageCollectionReason::kAllocationFailure);
   }
 
   Tagged<HeapObject> object;
@@ -484,15 +489,17 @@ Heap* HeapAllocator::heap_for_allocation(AllocationType allocation) {
 }
 
 bool HeapAllocator::RetryCustomAllocate(CustomAllocationFunction allocate,
-                                        AllocationType allocation) {
-  if (CollectGarbageAndRetryAllocation(allocate, allocation)) {
+                                        AllocationType allocation,
+                                        GarbageCollectionReason gc_reason) {
+  if (CollectGarbageAndRetryAllocation(allocate, allocation, gc_reason)) {
     return true;
   }
 
   // In the case of young allocations, the GCs above were minor GCs. Try "light"
   // full GCs before performing the last-resort GCs.
   if (allocation == AllocationType::kYoung) {
-    if (CollectGarbageAndRetryAllocation(allocate, AllocationType::kOld)) {
+    if (CollectGarbageAndRetryAllocation(allocate, AllocationType::kOld,
+                                         gc_reason)) {
       return true;
     }
   }
@@ -504,18 +511,21 @@ bool HeapAllocator::RetryCustomAllocate(CustomAllocationFunction allocate,
   return allocate();
 }
 
-void HeapAllocator::RetryCustomAllocateOrFail(CustomAllocationFunction allocate,
-                                              AllocationType allocation) {
-  if (RetryCustomAllocate(allocate, allocation)) return;
+void HeapAllocator::RetryCustomAllocateOrFail(
+    CustomAllocationFunction allocate, AllocationType allocation,
+    GarbageCollectionReason gc_reason) {
+  if (RetryCustomAllocate(allocate, allocation, gc_reason)) return;
   V8::FatalProcessOutOfMemory(heap_->isolate(), "CALL_AND_RETRY_LAST",
                               V8::kHeapOOM);
 }
 
-bool HeapAllocator::RetryCustomAllocateLight(CustomAllocationFunction allocate,
-                                             AllocationType allocation) {
+bool HeapAllocator::RetryCustomAllocateLight(
+    CustomAllocationFunction allocate, AllocationType allocation,
+    GarbageCollectionReason gc_reason) {
   DCHECK_NE(AllocationType::kYoung, allocation);
 
-  if (auto result = CollectGarbageAndRetryAllocation(allocate, allocation)) {
+  if (auto result =
+          CollectGarbageAndRetryAllocation(allocate, allocation, gc_reason)) {
     return result;
   }
 
@@ -525,14 +535,14 @@ bool HeapAllocator::RetryCustomAllocateLight(CustomAllocationFunction allocate,
 }
 
 bool HeapAllocator::CollectGarbageAndRetryAllocation(
-    CustomAllocationFunction allocate, AllocationType allocation) {
+    CustomAllocationFunction allocate, AllocationType allocation,
+    GarbageCollectionReason gc_reason) {
   const auto perform_heap_limit_check = v8_flags.late_heap_limit_check
                                             ? PerformHeapLimitCheck::kNo
                                             : PerformHeapLimitCheck::kYes;
 
   for (int i = 0; i < 2; i++) {
-    if (v8_flags.ineffective_gcs_forces_last_resort &&
-        allocation != AllocationType::kYoung &&
+    if (allocation != AllocationType::kYoung &&
         heap_for_allocation(allocation)
             ->HasConsecutiveIneffectiveMarkCompact()) {
       return false;
@@ -540,7 +550,7 @@ bool HeapAllocator::CollectGarbageAndRetryAllocation(
 
     // Skip the heap limit check in the GC if enabled. The heap limit needs to
     // be enforced by the caller.
-    CollectGarbage(allocation, perform_heap_limit_check);
+    CollectGarbage(allocation, perform_heap_limit_check, gc_reason);
 
     // As long as we are at or above the heap limit, we definitely need another
     // GC.
